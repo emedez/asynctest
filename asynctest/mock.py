@@ -22,8 +22,12 @@ import unittest.mock
 
 if sys.version_info >= (3, 5):
     from . import _awaitable
+    _async_magics = ("aenter", "aexit", )
 else:
     _awaitable = None
+    _async_magics = ()
+
+_async_magics = set(map("__{}__".format, _async_magics))
 
 
 # From python 3.6, a sentinel object is used to mark coroutines (rather than
@@ -105,19 +109,19 @@ def _mock_add_spec(self, spec, *args, **kwargs):
 
 
 def _get_child_mock(self, *args, _new_name=None, **kwargs):
-        if _new_name in self.__dict__['_spec_coroutines']:
-            return CoroutineMock(*args, **kwargs)
+    if _new_name in self.__dict__['_spec_coroutines']:
+        return CoroutineMock(*args, **kwargs)
 
-        _type = type(self)
-        if not issubclass(_type, unittest.mock.CallableMixin):
-            if issubclass(_type, unittest.mock.NonCallableMagicMock):
-                klass = MagicMock
-            elif issubclass(_type, NonCallableMock):
-                klass = Mock
-        else:
-            klass = _type.__mro__[1]
+    _type = type(self)
+    if not issubclass(_type, unittest.mock.CallableMixin):
+        if issubclass(_type, unittest.mock.NonCallableMagicMock):
+            klass = MagicMock
+        elif issubclass(_type, NonCallableMock):
+            klass = Mock
+    else:
+        klass = _type.__mro__[1]
 
-        return klass(**kwargs)
+    return klass(**kwargs)
 
 
 class MockMetaMixin(FakeInheritanceMeta):
@@ -151,6 +155,48 @@ class IsCoroutineArgMeta(MockMetaMixin):
             namespace['__setattr__'] = __setattr__
 
         return super().__new__(meta, name, base, namespace)
+
+
+class AsyncMagicMixin:
+    """
+    Add support for async magic methods to :class:`MagicMock` and
+    :class:`NonCallableMagicMock`.
+
+    Actually, it's a shameless copy-paste of :class:`unittest.mock.MagicMixin`:
+        when added to our classes, it will just do exactly what its
+        :mod:`unittest` counterpart does, but for magic methods. It adds some
+        behavior but should be compatible with future additions of
+        :class:`MagicMock`.
+    """
+    def __init__(self, *args, **kwargs):
+        self._mock_set_async_magics()  # make magic work for kwargs in init
+        unittest.mock._safe_super(AsyncMagicMixin, self).__init__(*args, **kwargs)
+        self._mock_set_async_magics()  # fix magic broken by upper level init
+
+    def _mock_set_async_magics(self):
+        these_magics = _async_magics
+
+        if getattr(self, "_mock_methods", None) is not None:
+            these_magics = _async_magics.intersection(self._mock_methods)
+
+            remove_magics = set()
+            remove_magics = _async_magics - these_magics
+
+            for entry in remove_magics:
+                if entry in type(self).__dict__:
+                    # remove unneeded magic methods
+                    delattr(self, entry)
+
+        # don't overwrite existing attributes if called a second time
+        these_magics = these_magics - set(type(self).__dict__)
+
+        _type = type(self)
+        for entry in these_magics:
+            setattr(_type, entry, unittest.mock.MagicProxy(entry, self))
+
+    def mock_add_spec(self, *args, **kwargs):
+        unittest.mock.MagicMock.mock_add_spec(self, *args, **kwargs)
+        self._mock_set_async_magics()
 
 
 # Notes about unittest.mock:
@@ -190,7 +236,7 @@ class NonCallableMock(unittest.mock.NonCallableMock,
         self._asynctest_set_is_coroutine(is_coroutine)
 
 
-class NonCallableMagicMock(unittest.mock.NonCallableMagicMock,
+class NonCallableMagicMock(AsyncMagicMixin, unittest.mock.NonCallableMagicMock,
                            metaclass=IsCoroutineArgMeta):
     """
     A version of :class:`~asynctest.MagicMock` that isn't callable.
@@ -241,7 +287,8 @@ class Mock(unittest.mock.Mock, metaclass=MockMetaMixin):
     """
 
 
-class MagicMock(unittest.mock.MagicMock, metaclass=MockMetaMixin):
+class MagicMock(AsyncMagicMixin, unittest.mock.MagicMock,
+                metaclass=MockMetaMixin):
     """
     Enhance :class:`unittest.mock.MagicMock` so it returns
     a :class:`~asynctest.CoroutineMock` object instead of
